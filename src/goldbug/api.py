@@ -17,9 +17,10 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable
 
-from .theory import predict_takeoff_population
+from .theory import predict_takeoff
 
-ETA = 1.78  # fitted on OLMo-2 1B at lr 1e-6; step counts are rough, use them to compare
+# fitted on the two OLMo-2 1B sweeps (lr 1e-6); step counts are rough, use them to compare
+ETA, RHO = 1.58, 0.65
 
 
 @dataclass
@@ -45,7 +46,7 @@ class Shortcut:
 def check(samples: list[dict], reward: Callable[[str, str], float],
           shortcuts: dict[str, tuple[Callable[[str], bool], Callable[[dict], str]]],
           oracle: Callable[[str, str], float] | None = None, G: int = 8, norm: str = "std",
-          eta: float = ETA) -> list[Shortcut]:
+          eta: float = ETA, rho: float = RHO) -> list[Shortcut]:
     """Predict which shortcuts RL will pick up with this reward.
 
     samples    dicts with "prompt_id", "gold" and "response", about 8 per prompt, sampled
@@ -74,12 +75,13 @@ def check(samples: list[dict], reward: Callable[[str, str], float],
             q_x.append(float(reward(write(rows[0]), gold) >= 0.5))
         p0 = max(hits / max(n, 1), 0.5 / max(n, 1))
         gain = sum(q - s for q, s in zip(q_x, s_x)) / max(len(q_x), 1)
-        steps = predict_takeoff_population(p0, s_x, q_x, G, norm, eta) if gain > 0 else math.inf
+        pays = sum(q > s for q, s in zip(q_x, s_x)) / max(len(q_x), 1)
+        steps = predict_takeoff(p0, s_x, q_x, G, norm, eta, rho) if pays > 0 else math.inf
         out.append(Shortcut(name, p0, hits > 0, sum(q_x) / max(len(q_x), 1), gain,
-                            sum(q > s for q, s in zip(q_x, s_x)) / max(len(q_x), 1), steps))
+                            pays, steps))
     return sorted(out, key=lambda r: (r.steps, -r.gain))
 
 
 def takeoff(p0: float, s: float, q: float, G: int = 8, norm: str = "std", eta: float = ETA) -> float:
     """Predicted RL steps until a shortcut takes over, from the three numbers alone."""
-    return predict_takeoff_population(p0, [s], [q], G, norm, eta) if q > s else math.inf
+    return predict_takeoff(p0, [s], [q], G, norm, eta) if q > s else math.inf

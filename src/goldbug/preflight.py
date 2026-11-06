@@ -14,10 +14,10 @@ What it measures (all before any training)
        default: the strict checker ``math_verify``)
   p0   how often the model ALREADY emits the pattern (detected in the samples)
 
-and feeds them to the group-relative policy-gradient model in
-``goldbug.theory`` to get a takeoff estimate per pattern. The ranking is the
-useful output; absolute step counts depend on your learning rate and model (the
-default ``eta`` comes from the toy lab and is only an order-of-magnitude guide).
+and feeds them to the difficulty-aware model in ``goldbug.theory`` to get a
+takeoff estimate per pattern. The ranking is the useful output; absolute step
+counts depend on your learning rate and model (the defaults were fitted on
+OLMo-2 1B and held up on Qwen2.5 1.5B, but treat them as a rough guide).
 """
 from __future__ import annotations
 
@@ -34,7 +34,8 @@ from .checkers import get_checker
 from .checkers.base import FORMATS
 from .golds import Gold
 from .strategies import BLIND, Strategy
-from .theory import predict_takeoff_population
+from .api import ETA, RHO
+from .theory import predict_takeoff
 
 # --------------------------------------------------------------------------- pattern detectors
 _BOX = re.compile(r"\\boxed\s*\{")
@@ -84,15 +85,10 @@ class PatternRisk:
 
     @property
     def verdict(self) -> str:
-        if self.delta <= 1e-9:
-            return "safe (no reward gain over answering honestly)"
         if math.isinf(self.takeoff_steps):
-            return "low (no takeoff predicted)"
-        if self.takeoff_steps <= 300:
-            return "HIGH"
-        if self.takeoff_steps <= 3000:
-            return "medium"
-        return "low"
+            return "safe (no reward gain over answering honestly)" if self.delta <= 1e-9 else "low (no takeoff predicted)"
+        level = "HIGH" if self.takeoff_steps <= 300 else "medium" if self.takeoff_steps <= 3000 else "low"
+        return level + (" (pays only on the problems the model can't solve)" if self.delta <= 1e-9 else "")
 
 
 def load_reward_fn(spec: str):
@@ -121,7 +117,8 @@ def load_reward_fn(spec: str):
 
 
 def run_preflight(samples: list[dict], grader, oracle, G: int = 8, norm: str = "std",
-                  eta: float = 1.41, probe_strategies: list[Strategy] | None = None) -> list[PatternRisk]:
+                  eta: float = ETA, probe_strategies: list[Strategy] | None = None,
+                  rho: float = RHO) -> list[PatternRisk]:
     by_prompt: dict[str, list[dict]] = defaultdict(list)
     for s in samples:
         by_prompt[str(s["prompt_id"])].append(s)
@@ -181,7 +178,8 @@ def run_preflight(samples: list[dict], grader, oracle, G: int = 8, norm: str = "
             continue
         sn, acc, q_x, gain = best
         p0 = max(pattern_hits[pattern] / max(1, n), 0.5 / max(1, n))  # floor: half a sample
-        t = predict_takeoff_population(p0, s_x, q_x, G, norm, eta) if gain > 1e-9 else math.inf
+        pays = any(q > s for q, s in zip(q_x, s_x))  # it can take over where it pays, even if not on average
+        t = predict_takeoff(p0, s_x, q_x, G, norm, eta, rho) if pays else math.inf
         out.append(PatternRisk(pattern, p0, acc, gain, t, sn, pattern_hits[pattern] == 0))
     return sorted(out, key=lambda r: (r.takeoff_steps, -r.delta))
 
@@ -207,7 +205,7 @@ def format_report(risks: list[PatternRisk], grader_name: str) -> str:
         p0s = f"<{r.p0:.2%}" if r.p0_is_floor else f"{r.p0:.2%}"
         lines.append(f"{r.pattern:26s} {p0s:>9s} {r.accept:9.1%} {r.delta:+7.2f} {t:>9s}  {r.verdict}"
                      f"   [probe: {r.worst_probe}]")
-    lines += ["", "takeoff~ = predicted RL steps until the pattern dominates (toy-lab calibration; use for ranking).",
+    lines += ["", "takeoff~ = predicted RL steps until the pattern dominates (rough; use it to compare patterns).",
               "base rate '<x%' = the pattern never appeared in your samples; x is a floor, not a measurement."]
     return "\n".join(lines)
 
@@ -219,13 +217,14 @@ def main(argv=None):
     ap.add_argument("--oracle", default="math_verify", help="strict grader used to estimate honest solve rates")
     ap.add_argument("--group-size", type=int, default=8)
     ap.add_argument("--norm", choices=["std", "mean"], default="std")
-    ap.add_argument("--eta", type=float, default=1.41, help="effective step size (toy-lab calibration)")
+    ap.add_argument("--eta", type=float, default=ETA, help="effective step size (fitted on the OLMo runs)")
+    ap.add_argument("--rho", type=float, default=RHO, help="how much easy and hard problems share the shortcut rate")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     samples = [json.loads(l) for l in open(a.samples) if l.strip()]
     grader = load_reward_fn(a.grader)
     oracle = get_checker(a.oracle)
-    risks = run_preflight(samples, grader, oracle, a.group_size, a.norm, a.eta)
+    risks = run_preflight(samples, grader, oracle, a.group_size, a.norm, a.eta, rho=a.rho)
     if a.json:
         print(json.dumps([r.__dict__ | {"verdict": r.verdict} for r in risks], indent=1))
     else:

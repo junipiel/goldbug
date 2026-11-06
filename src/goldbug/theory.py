@@ -241,3 +241,68 @@ def predict_takeoff_population(p0: float, s_list, q_list, G: int, norm: str, eta
     """Steps until the shortcut rate reaches p_end, from pre-RL measurements only."""
     return integrate_takeoff(drift_curve(s_list, q_list, G, norm, optimizer), p0, eta, p_end, max_steps)
 
+
+
+# ------------------------------------------------------------- shortcut rate that depends on difficulty
+# The model doesn't take a shortcut equally often everywhere: it picks it up faster on problems
+# it can't solve, where the shortcut pays most. Prompts are grouped by their honest solve rate s;
+# each group gets its own shortcut logit. Per step, a group's logit moves by
+#     eta * (rho * average drift over all groups + (1 - rho) * the group's own drift),
+# so rho = 1 is the version above (one shared shortcut rate) and smaller rho lets the groups
+# drift apart. Takeover = the shortcut rate averaged over prompts reaches p_end.
+
+def group_tables(s_list, q_list, G: int, norm: str, n: int = 161):
+    """Drift tables per difficulty group, on a logit grid."""
+    import numpy as np
+    from collections import Counter
+    pairs = Counter((round(float(s), 3), round(float(q), 3)) for s, q in zip(s_list, q_list))
+    svals = sorted({s for s, _ in pairs})
+    w = np.array([sum(c for (s, _), c in pairs.items() if s == sv) for sv in svals], dtype=float)
+    thetas = np.linspace(math.log(1e-5 / (1 - 1e-5)), math.log(0.9999 / 0.0001), n)
+    ps = 1 / (1 + np.exp(-thetas))
+    d = np.zeros((len(svals), n))
+    e = np.zeros((len(svals), n))
+    for i, sv in enumerate(svals):  # average over the q values seen at this difficulty
+        members = [(q, c) for (s, q), c in pairs.items() if s == sv]
+        for q, c in members:
+            dq, eq = moments_vec(ps, np.full(n, sv), np.full(n, q), G, norm)
+            d[i] += c / w[i] * dq
+            e[i] += c / w[i] * eq
+    return thetas, w / w.sum(), d, e
+
+
+def grouped_takeoff(tables, p0: float, etas, rho: float, G: int, p_end: float = 0.5, max_steps: int = 1000):
+    """Steps until the average shortcut rate reaches p_end (inf = never). Vectorised over etas."""
+    import numpy as np
+    thetas, w, d, e = tables
+    etas = np.atleast_1d(np.asarray(etas, dtype=float))
+    lo, hi, n = thetas[0], thetas[-1], len(thetas)
+    h = (hi - lo) / (n - 1)
+    p0 = min(max(p0, 1e-4), 0.49)
+    th = np.full((len(etas), len(w)), math.log(p0 / (1 - p0)))
+    out = np.full(len(etas), np.inf)
+    alive = np.ones(len(etas), dtype=bool)
+    rows = np.arange(len(w))[None, :]
+    for t in range(1, max_steps + 1):
+        x = (np.clip(th, lo, hi) - lo) / h
+        i = np.minimum(x.astype(int), n - 2)
+        f = x - i
+        dg = d[rows, i] * (1 - f) + d[rows, i + 1] * f
+        eg = e[rows, i] * (1 - f) + e[rows, i + 1] * f
+        rms = np.sqrt(np.maximum((eg * w).sum(1, keepdims=True) / G, 1e-12))
+        D = dg / G / rms
+        step = rho * (D * w).sum(1, keepdims=True) + (1 - rho) * D
+        stuck = (step <= 0).all(1)
+        th = th + etas[:, None] * step
+        hit = alive & ((w / (1 + np.exp(-th))).sum(1) >= p_end)
+        out[hit] = t
+        alive &= ~hit & ~stuck
+        if not alive.any():
+            break
+    return out
+
+
+def predict_takeoff(p0: float, s_list, q_list, G: int, norm: str = "std", eta: float = 1.58, rho: float = 0.65,
+                    max_steps: int = 1000) -> float:
+    """Steps until the shortcut takes over, from pre-RL measurements (difficulty-aware)."""
+    return float(grouped_takeoff(group_tables(s_list, q_list, G, norm), p0, [eta], rho, G, max_steps=max_steps)[0])

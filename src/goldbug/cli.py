@@ -21,7 +21,7 @@ def _theory(argv):
     ap.add_argument("--s", type=float, required=True, help="honest solve rate")
     ap.add_argument("--q", type=float, required=True, help="grader acceptance rate of the shortcut")
     ap.add_argument("--G", type=int, default=8)
-    ap.add_argument("--eta", type=float, default=1.41, help="effective step size (default: toy-lab calibration)")
+    ap.add_argument("--eta", type=float, default=1.58, help="effective step size (default: fitted on the OLMo runs)")
     a = ap.parse_args(argv)
     if a.q <= a.s:
         print(f"q ({a.q}) <= s ({a.s}): the shortcut earns less than answering honestly -> no takeoff predicted.")

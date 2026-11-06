@@ -12,6 +12,12 @@ Why some bugs get exploited and others don't: a bug only matters if some shortcu
 
 where G is the group size and η is a constant you fit once for your setup. Everything else can be measured before training.
 
+That formula assumes the model takes the shortcut equally often on every problem. It doesn't. It learns to cheat where it can't solve the problem, because that's where the shortcut pays most:
+
+![Shortcut use after training, by how often the model solved the problem before training](results/figures/selective.png)
+
+So goldbug tracks the shortcut rate separately for easy and hard problems, with one extra constant for how much the two influence each other. This matters most when a shortcut only barely beats honest answers on average, because it can still take over the hard problems.
+
 ## Install
 
     pip install -e .                  # enough for your own project (numpy and scipy only)
@@ -40,7 +46,7 @@ for sc in goldbug.check(samples, reward=my_reward, shortcuts=shortcuts):
 which prints something like
 
 ```
-always_zero: base rate 3.44%, accepted 50%, gain +0.23, takeover ~40 steps
+always_zero: base rate 3.44%, accepted 50%, gain +0.23, takeover ~36 steps
 exit_early: base rate <0.16%, accepted 0%, gain -0.26, takeover never
 ```
 
@@ -60,9 +66,11 @@ The Qwen2.5-Math grader needs `antlr4-python3-runtime==4.7.2`, which clashes wit
 
 - None of the 11 math graders I tested (math-verify, TRL, open-r1, verl, lm-eval, OpenCompass, Qwen2.5-Math, rLLM) pays out for an answer that doesn't depend on the problem. Their mistakes are near misses: the Qwen2.5-Math grader accepts 4200 for 42, and verl's gsm8k scorer rejects 42.0. A model can't farm those. The full list is in [results/census.md](results/census.md).
 - In 5 of reasoning-gym's 105 tasks, an answer that ignores the problem does beat the best constant answer. Copying the question scores 0.12 on `rotate_matrix`.
-- On OLMo-2 1B I fitted η on one sweep and then froze everything for a second sweep of 54 runs. The formula called 50 of them right; a plain "q > s" rule gets 48. It predicted the takeover step to within about 2x. It is too slow when q − s is small, probably because the model learns to take the shortcut only on problems it can't solve.
+- On OLMo-2 1B I fitted the two constants on one sweep and then froze them to predict a second sweep of 54 runs. It called 52 of them right (a plain "q > s" rule gets 48) and predicted the takeover step to within about 1.3x on typical runs. Of the two misses, one took over exactly at the 200-step cutoff, and in the other an almost identical run took over while this one didn't, which is just training noise.
+- I added the easy/hard split after seeing the simpler version miss on small gaps, so I tested it on a second model, Qwen2.5 1.5B, with the constants from the OLMo runs left unchanged. It called 35 of 36 runs right (the simple rule gets 33), and the takeover step was right on average. Ranking how fast is weaker there, because most takeovers happened within the first 10 steps. Fitting the constant on a few Qwen runs instead made things worse, so the OLMo values are the defaults.
+- The chart at the top comes from the 7 Qwen runs that were taken over at the smaller bug rate. The effect showed up in every one of them: the correlation between solve rate before training and shortcut use after was between −0.45 and −0.61.
 
-The LLM runs used [Modal](https://modal.com), at about $7 per 54-run sweep. See `scripts/modal_app.py`, and `scripts/figures.sh` to redraw the plot from the saved runs.
+The LLM runs used [Modal](https://modal.com), at about $7 per 54-run sweep. The saved runs are in `results/`; `scripts/confirm.py` recomputes the numbers above and `scripts/figures.sh` redraws the plot.
 
 The closest related work is [SimHack](https://arxiv.org/abs/2610.28707), which predicts reward hacking with a simulator trained on reference runs. goldbug uses a formula instead and needs no reference runs.
 
